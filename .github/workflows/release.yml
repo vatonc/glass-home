@@ -1,0 +1,54 @@
+name: Package and release Chrome extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Package runtime extension files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_dir="dist/glass-home"
+          rm -rf dist
+          mkdir -p "$package_dir"
+
+          cp manifest.json newtab.html "$package_dir/"
+          while IFS= read -r file; do
+            mkdir -p "$package_dir/$(dirname "$file")"
+            cp "$file" "$package_dir/$file"
+          done < <(find css js icons -type f ! -name '_*' \( \
+            -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.png' -o -name '*.svg' \
+          \) -print)
+
+          test -f "$package_dir/manifest.json"
+          test -f "$package_dir/newtab.html"
+          test -f "$package_dir/css/newtab.css"
+          test -f "$package_dir/js/newtab.js"
+          test -f "$package_dir/icons/icon128.png"
+          if find "$package_dir" -type f \( -name '*.ps1' -o -name '_*' \) -print -quit | grep -q .; then
+            echo 'Development files were included in the package.' >&2
+            exit 1
+          fi
+
+          (cd "$package_dir" && zip -r "../../glass-home-${GITHUB_REF_NAME}.zip" .)
+
+      - name: Create GitHub Release and upload package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "glass-home-${GITHUB_REF_NAME}.zip" \
+            --title "Glass Home ${GITHUB_REF_NAME}" \
+            --generate-notes
