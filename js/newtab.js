@@ -22,17 +22,19 @@
     { id: "chatgpt", name: "ChatGPT", url: "https://chatgpt.com" },
     { id: "gemini", name: "Gemini", url: "https://gemini.google.com" }
   ];
-  const OLD_DEFAULT_IDS = ["bili", "douban", "github", "taobao", "translate", "weibo", "youtube", "zhihu"];
 
   const STORE_KEY = "glass-home";
   const MAX_SITES = 24;
   const MAX_HISTORY = 30;
   const HIST_VISIBLE = 8;
-  const MAX_LOCAL = 12;
   const MAX_BING = 48;
   const BING_VISIBLE = 8;
   const BING_SEED = 24;
   const BING_REFRESH_MS = 30 * 60 * 1000;
+  const MIN_FILE_MB = 20;
+  const MAX_FILE_MB = 300;
+  const DEFAULT_FILE_MB = 50;
+  const MAX_CROP_ZOOM = 10;
 
   const $ = (id) => document.getElementById(id);
   const grid = $("grid");
@@ -42,6 +44,14 @@
   const sugList = $("sug-list");
   const bgPreset = $("bg-preset");
   const bgImage = $("bg-image");
+  const bgVideo = $("bg-video");
+  const cropBackdrop = $("crop-backdrop");
+  const cropStage = $("crop-stage");
+  const cropFrame = $("crop-frame");
+  let cropState = null;
+  let cropId = "";
+  let cropGen = 0;
+  let selectionGen = 0;
 
   const state = fresh();
   let editingId = null;
@@ -59,12 +69,13 @@
     return {
       engine: "bing",
       sites: DEFAULT_SITES.map((site) => ({ ...site })),
-      wallpaper: { type: "bing", preset: "aurora", bingId: "", localId: "", credit: "", auto: true },
+      wallpaper: { type: "bing", preset: "aurora", bingId: "", localId: "", credit: "", auto: true, crop: null },
       bingHistory: [],
       history: [],
       localIds: [],
       blur: 0,
       dim: 0.32,
+      fileLimitMb: DEFAULT_FILE_MB,
       defaults: 2
     };
   }
@@ -89,7 +100,9 @@
   function normalizeUrl(raw) {
     const text = raw.trim();
     if (!text) return "";
-    return safeHttpUrl(/^[a-z][a-z0-9+.-]*:/i.test(text) ? text : `https://${text}`);
+    if (/^[a-z][a-z0-9+.-]*:/i.test(text) && !/^https?:\/\//i.test(text)
+      && !/^[^/:?#]+:\d+(?:[/?#]|$)/.test(text)) return "";
+    return safeHttpUrl(/^https?:\/\//i.test(text) ? text : `https://${text}`);
   }
 
   function cleanHistory(items) {
@@ -164,6 +177,20 @@
     }
   }
 
+  let settingsReady = false;
+  let saveQueue = Promise.resolve();
+  let pendingSettings = new Set();
+  let localRenderGen = 0;
+  let resetGen = 0;
+  const writingFields = new Map();
+
+  function reportStorageError(error) {
+    const message = error && error.message ? error.message : "未知错误";
+    $("local-note").textContent = `设置存取失败（${message}），请重新加载扩展`;
+    alert(`设置存取失败：${message}。更改可能未保存，请重新加载扩展后重试。`);
+    console.error("[玻璃主页] 设置存取失败：", message);
+  }
+
   function loadSettings() {
     const storage = chromeStorage();
     if (!storage) {
@@ -173,29 +200,74 @@
         return Promise.resolve(null);
       }
     }
-    return new Promise((resolve) => {
-      storage.get(STORE_KEY, (data) => resolve(data ? data[STORE_KEY] : null));
+    const keys = Object.keys(state).map((key) => `${STORE_KEY}:${key}`);
+    return new Promise((resolve, reject) => {
+      storage.get([STORE_KEY, ...keys], (data) => {
+        const error = chrome.runtime && chrome.runtime.lastError;
+        if (error) {
+          reject(new Error(error.message));
+          return;
+        }
+        const legacy = data && data[STORE_KEY];
+        const fields = keys.reduce((result, key) => {
+          if (Object.hasOwn(data, key)) result[key.slice(STORE_KEY.length + 1)] = data[key];
+          return result;
+        }, {});
+        resolve(Object.keys(fields).length ? { ...(legacy || {}), ...fields } : legacy || null);
+      });
     });
   }
 
-  function saveSettings() {
-    const payload = {
-      engine: state.engine,
-      sites: state.sites,
-      wallpaper: state.wallpaper,
-      bingHistory: state.bingHistory,
-      history: state.history,
-      localIds: state.localIds,
-      blur: state.blur,
-      dim: state.dim,
-      defaults: state.defaults
-    };
-    const storage = chromeStorage();
-    if (!storage) {
-      localStorage.setItem(STORE_KEY, JSON.stringify(payload));
+  function settingsPayload(keys) {
+    const payload = {};
+    keys.forEach((key) => { payload[`${STORE_KEY}:${key}`] = state[key]; });
+    return payload;
+  }
+
+  function saveSettings(keys = null) {
+    if (!settingsReady) {
+      if (keys) keys.forEach((key) => pendingSettings.add(key));
+      else Object.keys(state).forEach((key) => pendingSettings.add(key));
       return Promise.resolve();
     }
-    return new Promise((resolve) => storage.set({ [STORE_KEY]: payload }, resolve));
+    const changed = keys ? new Set(keys) : new Set(Object.keys(state));
+    if (pendingSettings.size) {
+      pendingSettings.forEach((key) => changed.add(key));
+      pendingSettings.clear();
+    }
+    const payload = structuredClone(settingsPayload(changed));
+    changed.forEach((key) => writingFields.set(key, (writingFields.get(key) || 0) + 1));
+    const storage = chromeStorage();
+    saveQueue = saveQueue.catch(() => {}).then(() => {
+      if (!storage) {
+        let current = null;
+        try { current = JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch { /* ignore malformed local data */ }
+        const fields = {};
+        Object.entries(payload).forEach(([key, value]) => { fields[key.slice(STORE_KEY.length + 1)] = value; });
+        localStorage.setItem(STORE_KEY, JSON.stringify({ ...(current || {}), ...fields }));
+        return;
+      }
+      return new Promise((resolve, reject) => storage.set(payload, () => {
+        const error = chrome.runtime && chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve();
+      }));
+    });
+    saveQueue.then(() => {
+      changed.forEach((key) => {
+        const remaining = writingFields.get(key) - 1;
+        if (remaining) writingFields.set(key, remaining);
+        else writingFields.delete(key);
+      });
+    }, (error) => {
+      changed.forEach((key) => {
+        const remaining = writingFields.get(key) - 1;
+        if (remaining) writingFields.set(key, remaining);
+        else writingFields.delete(key);
+      });
+      reportStorageError(error);
+    });
+    return saveQueue;
   }
 
   function sanitize(saved) {
@@ -212,11 +284,7 @@
         .filter(Boolean)
         .slice(0, MAX_SITES);
       state.sites = sites;
-      const ids = sites.map((site) => site.id).sort();
-      if (saved.defaults !== 2 && ids.join() === OLD_DEFAULT_IDS.join()) {
-        state.sites = DEFAULT_SITES.map((site) => ({ ...site }));
-        migrated = true;
-      }
+      // 旧默认导航的完整原始内容无法确认，保留已有列表以免丢失用户编辑。
     }
     state.defaults = 2;
     const wall = saved.wallpaper || {};
@@ -228,7 +296,12 @@
       bingId: String(wall.bingId || ""),
       localId: String(wall.localId || ""),
       credit: String(wall.credit || ""),
-      auto: wall.auto !== false
+      auto: wall.auto !== false,
+      crop: wall.crop && typeof wall.crop === "object" ? {
+        zoom: Math.min(MAX_CROP_ZOOM, Math.max(1, Number(wall.crop.zoom) || 1)),
+        offsetX: Number.isFinite(Number(wall.crop.offsetX)) ? Math.min(1, Math.max(0, Number(wall.crop.offsetX))) : 0.5,
+        offsetY: Number.isFinite(Number(wall.crop.offsetY)) ? Math.min(1, Math.max(0, Number(wall.crop.offsetY))) : 0.5
+      } : null
     };
     if (Array.isArray(saved.bingHistory)) {
       state.bingHistory = saved.bingHistory
@@ -241,7 +314,7 @@
         .slice(0, MAX_BING);
     }
     if (Array.isArray(saved.localIds)) {
-      state.localIds = saved.localIds.filter((id) => typeof id === "string").slice(0, MAX_LOCAL);
+      state.localIds = saved.localIds.filter((id) => typeof id === "string");
     }
     if (Array.isArray(saved.history)) {
       state.history = cleanHistory(saved.history);
@@ -251,6 +324,9 @@
     }
     if (typeof saved.blur === "number" && Number.isFinite(saved.blur)) {
       state.blur = Math.min(30, Math.max(0, saved.blur));
+    }
+    if (typeof saved.fileLimitMb === "number" && Number.isFinite(saved.fileLimitMb)) {
+      state.fileLimitMb = Math.min(MAX_FILE_MB, Math.max(MIN_FILE_MB, Math.round(saved.fileLimitMb)));
     } else if (Object.hasOwn(saved, "dim")) {
       migrated = true;
     }
@@ -278,9 +354,11 @@
 
   function idbSet(key, value) {
     return db().then((database) => new Promise((resolve, reject) => {
-      const request = database.transaction("blobs", "readwrite").objectStore("blobs").put(value, key);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      const transaction = database.transaction("blobs", "readwrite");
+      transaction.objectStore("blobs").put(value, key);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
     }));
   }
 
@@ -309,10 +387,27 @@
     document.documentElement.style.setProperty("--dim", String(state.dim));
   }
 
+  function styleCropMedia(media, crop) {
+    const { zoom, offsetX, offsetY } = crop || { zoom: 1, offsetX: 0.5, offsetY: 0.5 };
+    media.style.objectPosition = `${offsetX * 100}% ${offsetY * 100}%`;
+    media.style.transform = `translate(${(0.5 - offsetX) * (zoom - 1) * 100}%, ${(0.5 - offsetY) * (zoom - 1) * 100}%) scale(${zoom})`;
+  }
+
+  function applyCropStyle() {
+    [bgImage, bgVideo].forEach((media) => {
+      styleCropMedia(media, state.wallpaper.crop);
+      media.style.inset = "0";
+      media.style.width = "100%";
+      media.style.height = "100%";
+    });
+  }
+
   function applySkin() {
-    const preset = state.wallpaper.type === "preset" ? state.wallpaper.preset : "aurora";
-    bgPreset.className = `bg-preset skin-${preset}`;
+    bgPreset.className = state.wallpaper.type === "preset"
+      ? `bg-preset skin-${state.wallpaper.preset}`
+      : "bg-preset";
     setBlur(state.blur);
+    applyCropStyle();
     setCredit();
   }
 
@@ -321,27 +416,49 @@
   function hideImage() {
     paintGen += 1;
     bgImage.classList.remove("is-on");
+    bgVideo.classList.remove("is-on");
+    bgVideo.pause();
+    bgVideo.removeAttribute("src");
+    bgVideo.load();
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+      objectUrl = "";
+    }
   }
 
   function showBlob(blob) {
-    const token = ++paintGen;
+    hideImage();
+    applyCropStyle();
+    const token = paintGen;
+    const video = blob.type.startsWith("video/");
+    const media = video ? bgVideo : bgImage;
     const next = URL.createObjectURL(blob);
+    objectUrl = next;
     const reveal = () => {
-      if (token !== paintGen) {
-        URL.revokeObjectURL(next);
-        return;
-      }
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-      objectUrl = next;
-      bgImage.classList.add("is-on");
+      if (token !== paintGen) return;
+      media.classList.add("is-on");
     };
-    bgImage.onload = reveal;
-    bgImage.src = next;
-    if (bgImage.complete && bgImage.naturalWidth) reveal();
+    media.onerror = () => {
+      if (token !== paintGen) return;
+      hideImage();
+      bgPreset.className = "bg-preset skin-aurora";
+    };
+    if (video) {
+      media.onloadeddata = reveal;
+      media.muted = true;
+    } else {
+      media.onload = reveal;
+    }
+    media.src = next;
   }
 
   async function showStored(key) {
+    const token = paintGen;
     const blob = await idbGet(key).catch(() => null);
+    const currentKey = state.wallpaper.type === "local"
+      ? `local:${state.wallpaper.localId}`
+      : state.wallpaper.type === "bing" ? `bing:${state.wallpaper.bingId}` : "";
+    if (token !== paintGen || key !== currentKey) return null;
     if (!blob) return false;
     showBlob(blob);
     return true;
@@ -373,9 +490,19 @@
       : `bing:${state.wallpaper.bingId}`;
     if (!key.endsWith(":")) {
       const shown = await showStored(key);
-      if (shown) return;
+      if (shown !== false) return;
+      if (state.wallpaper.type === "bing") {
+        const selection = selectionGen;
+        const id = state.wallpaper.bingId;
+        try {
+          const blob = await cacheBing(id);
+          if (selection === selectionGen && state.wallpaper.type === "bing" && state.wallpaper.bingId === id) showBlob(blob);
+        } catch { /* 暂时使用默认背景，稍后刷新时重试 */ }
+        return;
+      }
     }
     hideImage();
+    bgPreset.className = "bg-preset skin-aurora";
   }
 
   function faviconUrl(pageUrl, size) {
@@ -555,6 +682,15 @@
       label.textContent = text;
       button.append(label);
       item.append(button);
+      if (kind === "history") {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "history-x";
+        remove.dataset.removeHistory = text;
+        remove.setAttribute("aria-label", `删除搜索历史：${text}`);
+        remove.textContent = "×";
+        item.append(remove);
+      }
       fragment.append(item);
     });
     sugList.append(fragment);
@@ -569,6 +705,13 @@
   }
 
   function showHistory() {
+    sugSeq += 1;
+    clearTimeout(sugTimer);
+    sugTimer = 0;
+    if (sugAbort) {
+      sugAbort.abort();
+      sugAbort = null;
+    }
     if ($("q").value.trim()) return;
     const list = state.history.slice(0, HIST_VISIBLE);
     if (!list.length) {
@@ -579,7 +722,7 @@
   }
 
   function paintSug() {
-    const buttons = Array.from(sugList.querySelectorAll("button"));
+    const buttons = Array.from(sugList.querySelectorAll("[data-sug]"));
     buttons.forEach((button, index) => {
       const active = index === sugIndex;
       button.classList.toggle("is-active", active);
@@ -623,6 +766,7 @@
       sugCache.set(key, list);
       return list;
     } catch {
+      if (controller.signal.aborted) return [];
       // 请求失败（含 host 权限未生效导致的 CORS 拦截）时短暂停用该引擎，避免刷屏
       if (!sugFail.has(engineId)) {
         console.warn(`[玻璃主页] ${engineId} 联想接口请求失败，已暂停 60 秒。若为 CORS 报错，请在 chrome://extensions 重新加载本扩展，使新增的 host 权限生效。`);
@@ -779,6 +923,7 @@
   }
 
   async function renderLocal() {
+    const renderGen = ++localRenderGen;
     localUrls.forEach((url) => URL.revokeObjectURL(url));
     localUrls.clear();
     const list = $("local-list");
@@ -800,13 +945,22 @@
       button.dataset.local = id;
       button.setAttribute("aria-label", "使用这张本地壁纸");
       const blob = await idbGet(`local:${id}`).catch(() => null);
+      if (renderGen !== localRenderGen) return;
       if (blob) {
         const url = URL.createObjectURL(blob);
         localUrls.set(id, url);
-        const img = document.createElement("img");
-        img.alt = "";
-        img.src = url;
-        button.append(img);
+        const video = blob.type.startsWith("video/");
+        const media = document.createElement(video ? "video" : "img");
+        if (video) {
+          media.muted = true;
+          media.loop = true;
+          media.autoplay = true;
+          media.playsInline = true;
+        } else {
+          media.alt = "";
+        }
+        media.src = url;
+        button.append(media);
       }
       const remove = document.createElement("button");
       remove.type = "button";
@@ -829,6 +983,8 @@
       $("blur").value = String(state.blur);
       renderLocal();
       renderBing();
+      $("file-limit").value = String(state.fileLimitMb);
+      $("file-limit-value").textContent = `${state.fileLimitMb}MB`;
       syncActive();
       maybeRefreshBing();
     }
@@ -851,79 +1007,311 @@
   }
 
   function selectPreset(id) {
+    selectionGen += 1;
+    cropGen += 1;
+    if (!cropBackdrop.hidden) closeCrop();
     state.wallpaper.type = "preset";
     state.wallpaper.preset = id;
+    state.wallpaper.crop = null;
     state.wallpaper.credit = "";
     hideImage();
     applySkin();
-    saveSettings();
+    saveSettings(["wallpaper"]);
     syncActive();
   }
 
   async function selectBing(image) {
+    const selection = ++selectionGen;
+    cropGen += 1;
+    if (!cropBackdrop.hidden) closeCrop();
+    hideImage();
     state.wallpaper.type = "bing";
     state.wallpaper.bingId = image.id;
+    state.wallpaper.crop = null;
     state.wallpaper.credit = image.copyright || "";
     applySkin();
-    saveSettings();
+    saveSettings(["wallpaper"]);
     syncActive();
     $("bing-auto").checked = Boolean(state.wallpaper.auto);
     try {
-      showBlob(await cacheBing(image.id));
+      const blob = await cacheBing(image.id);
+      if (selection === selectionGen) showBlob(blob);
     } catch {
-      $("bing-status").textContent = "这张壁纸暂时加载失败";
+      if (selection === selectionGen) {
+        bgPreset.className = "bg-preset skin-aurora";
+        $("bing-status").textContent = "这张壁纸暂时加载失败";
+      }
     }
   }
 
   async function selectLocal(id) {
+    const selection = ++selectionGen;
+    paintGen += 1;
+    cropGen += 1;
+    if (!cropBackdrop.hidden) closeCrop();
     const blob = await idbGet(`local:${id}`).catch(() => null);
+    if (selection !== selectionGen || !state.localIds.includes(id)) return;
     if (!blob) {
-      $("local-note").textContent = "这张图片已不可用";
+      $("local-note").textContent = "这张壁纸已不可用";
       return;
     }
+    const sameWallpaper = state.wallpaper.type === "local" && state.wallpaper.localId === id;
     state.wallpaper.type = "local";
     state.wallpaper.localId = id;
+    if (!sameWallpaper) state.wallpaper.crop = null;
     state.wallpaper.credit = "";
     applySkin();
     showBlob(blob);
-    saveSettings();
+    saveSettings(["wallpaper"]);
     syncActive();
   }
 
   async function removeLocal(id) {
+    if (!cropBackdrop.hidden && cropId === id) closeCrop();
     state.localIds = state.localIds.filter((item) => item !== id);
+    const selection = selectionGen;
     await idbDelete(`local:${id}`).catch(() => {});
-    if (state.wallpaper.type === "local" && state.wallpaper.localId === id) {
+    if (selection === selectionGen && state.wallpaper.type === "local" && state.wallpaper.localId === id) {
+      cropGen += 1;
       state.wallpaper.type = "preset";
       state.wallpaper.preset = state.wallpaper.preset || "aurora";
       hideImage();
       applySkin();
+      saveSettings(["wallpaper"]);
     }
-    saveSettings();
+    saveSettings(["localIds"]);
     renderLocal();
   }
 
-  async function addLocal(file) {
-    if (!file || !file.type.startsWith("image/")) throw new Error("请选择图片文件");
-    if (file.size > 30 * 1024 * 1024) throw new Error("图片请小于 30MB");
-    const bitmap = await createImageBitmap(file);
-    const scale = Math.min(1, 1920 / Math.max(bitmap.width, bitmap.height));
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    bitmap.close();
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.86));
-    if (!blob) throw new Error("无法处理这张图片");
-    const id = uid();
-    await idbSet(`local:${id}`, blob);
-    state.localIds.unshift(id);
-    const dropped = state.localIds.slice(MAX_LOCAL);
-    state.localIds = state.localIds.slice(0, MAX_LOCAL);
-    await Promise.all(dropped.map((item) => idbDelete(`local:${item}`).catch(() => {})));
-    await renderLocal();
-    await selectLocal(id);
+  function decodeImage(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const image = new Image();
+      image.decoding = "async";
+      const finish = (error) => {
+        URL.revokeObjectURL(url);
+        if (error) reject(error);
+        else resolve(image);
+      };
+      image.onload = () => {
+        if (image.naturalWidth && image.naturalHeight) finish();
+        else finish(new Error("empty image"));
+      };
+      image.onerror = () => finish(new Error("decode image"));
+      image.src = url;
+      if (image.decode) {
+        image.decode().catch(() => {
+          // 某些浏览器的 decode() 对 PNG 会拒绝，但 onload 仍能证明图片可绘制。
+        });
+      }
+    });
   }
+
+  async function addLocal(file) {
+    const reset = resetGen;
+    const selection = ++selectionGen;
+    cropGen += 1;
+    if (!cropBackdrop.hidden) closeCrop();
+    if (!file) throw new Error("请选择图片或视频文件");
+    if (file.size > state.fileLimitMb * 1024 * 1024) {
+      throw new Error(`文件不能超过 ${state.fileLimitMb}MB`);
+    }
+    const video = file.type.startsWith("video/") || /\.(mp4|webm|mov|m4v|ogv)$/i.test(file.name || "");
+    const gif = file.type === "image/gif" || /\.gif$/i.test(file.name || "");
+    if (!video && !file.type.startsWith("image/") && !/\.(png|jpe?g|webp|gif)$/i.test(file.name || "")) {
+      throw new Error("请选择图片或视频文件");
+    }
+    let blob = file;
+    if (video && !file.type.startsWith("video/")) {
+      const ext = file.name.split(".").pop().toLowerCase();
+      const types = { mp4: "video/mp4", m4v: "video/mp4", webm: "video/webm", mov: "video/quicktime", ogv: "video/ogg" };
+      blob = file.slice(0, file.size, types[ext]);
+    } else if (gif && file.type !== "image/gif") {
+      blob = file.slice(0, file.size, "image/gif");
+    }
+    if (!video) {
+      let image;
+      try {
+        image = await decodeImage(blob);
+      } catch {
+        throw new Error("无法解码这张图片，请确认文件完整且格式受浏览器支持");
+      }
+      // 保留图片原始文件和原生分辨率，不再缩放或重新编码。
+      // GIF 也保持原始动图数据，避免破坏动画效果。
+    }
+    if (reset !== resetGen) return;
+    const id = uid();
+    try {
+      await idbSet(`local:${id}`, blob);
+    } catch {
+      throw new Error("浏览器无法保存该文件；请检查存储空间或重新加载扩展");
+    }
+    if (reset !== resetGen) {
+      await idbDelete(`local:${id}`).catch(() => {});
+      return;
+    }
+    state.localIds.unshift(id);
+    await saveSettings(["localIds"]);
+    await renderLocal();
+    if (selection === selectionGen) await selectLocal(id);
+  }
+
+  async function openCrop() {
+    if (state.wallpaper.type !== "local") {
+      $("local-note").textContent = "请先选择本地图片或视频壁纸";
+      return;
+    }
+    const id = state.wallpaper.localId;
+    const token = ++cropGen;
+    const selection = selectionGen;
+    const blob = await idbGet(`local:${id}`).catch(() => null);
+    if (token !== cropGen || selection !== selectionGen || state.wallpaper.type !== "local" || state.wallpaper.localId !== id) return;
+    if (!blob) {
+      $("local-note").textContent = "当前壁纸已不可用";
+      return;
+    }
+    if (!cropBackdrop.hidden) closeCrop();
+    cropId = id;
+    const media = document.createElement(blob.type.startsWith("video/") ? "video" : "img");
+    media.className = "crop-media";
+    if (media.tagName === "VIDEO") {
+      media.muted = true;
+      media.autoplay = true;
+      media.loop = true;
+      media.playsInline = true;
+    }
+    media.draggable = false;
+    cropStage.prepend(media);
+    cropState = { ...(state.wallpaper.crop || { zoom: 1, offsetX: 0.5, offsetY: 0.5 }) };
+    $("crop-error").textContent = "";
+    $("crop-save").disabled = true;
+    const ready = () => {
+      if (cropStage.contains(media)) {
+        $("crop-save").disabled = false;
+        updateCropFrame();
+      }
+    };
+    media.onload = ready;
+    media.onloadedmetadata = ready;
+    media.onerror = () => {
+      if (cropStage.contains(media)) {
+        $("crop-save").disabled = true;
+        $("crop-error").textContent = "无法加载该壁纸，请确认文件格式受浏览器支持";
+      }
+    };
+    media.src = URL.createObjectURL(blob);
+    cropBackdrop.hidden = false;
+    updateCropFrame();
+    cropStage.focus();
+  }
+
+  function updateCropFrame() {
+    if (!cropState) return;
+    const rect = cropStage.getBoundingClientRect();
+    const ratio = window.innerWidth / window.innerHeight;
+    const width = Math.min(rect.width, rect.height * ratio);
+    const height = width / ratio;
+    const left = (rect.width - width) / 2;
+    const top = (rect.height - height) / 2;
+    const media = cropStage.querySelector("img, video");
+    [cropFrame, media].forEach((element) => {
+      element.style.left = `${left}px`;
+      element.style.top = `${top}px`;
+      element.style.width = `${width}px`;
+      element.style.height = `${height}px`;
+    });
+    styleCropMedia(media, cropState);
+    $("crop-zoom").value = String(cropState.zoom);
+    $("crop-zoom-value").textContent = `${Math.round(cropState.zoom * 100)}%`;
+  }
+
+  function closeCrop() {
+    cropGen += 1;
+    const wasOpen = !cropBackdrop.hidden;
+    cropBackdrop.hidden = true;
+    const media = cropStage.querySelector("img, video");
+    if (media) {
+      URL.revokeObjectURL(media.src);
+      media.remove();
+    }
+    cropState = null;
+    cropId = "";
+    if (wasOpen) $("crop-current").focus();
+  }
+
+  function saveCrop() {
+    if (!cropState || $("crop-save").disabled || state.wallpaper.type !== "local" || state.wallpaper.localId !== cropId) return;
+    state.wallpaper.crop = { ...cropState };
+    saveSettings(["wallpaper"]);
+    applyCropStyle();
+    closeCrop();
+  }
+
+  $("crop-zoom").addEventListener("input", (event) => {
+    if (!cropState) return;
+    cropState.zoom = Number(event.target.value);
+    updateCropFrame();
+  });
+
+  cropStage.addEventListener("wheel", (event) => {
+    if (!cropState || !event.deltaY) return;
+    event.preventDefault();
+    cropState.zoom = Math.min(MAX_CROP_ZOOM, Math.max(1, Math.round(cropState.zoom * (event.deltaY < 0 ? 1.08 : 1 / 1.08) * 100) / 100));
+    updateCropFrame();
+  }, { passive: false });
+
+  function moveCrop(dx, dy) {
+    if (!cropState) return;
+    const media = cropStage.querySelector("img, video");
+    const frame = cropFrame.getBoundingClientRect();
+    const naturalWidth = media.videoWidth || media.naturalWidth;
+    const naturalHeight = media.videoHeight || media.naturalHeight;
+    if (!naturalWidth || !naturalHeight || !frame.width || !frame.height) return;
+    const scale = Math.max(frame.width / naturalWidth, frame.height / naturalHeight) * cropState.zoom;
+    const overflowX = naturalWidth * scale - frame.width;
+    const overflowY = naturalHeight * scale - frame.height;
+    if (overflowX > 0.001) cropState.offsetX = Math.max(0, Math.min(1, cropState.offsetX - dx / overflowX));
+    if (overflowY > 0.001) cropState.offsetY = Math.max(0, Math.min(1, cropState.offsetY - dy / overflowY));
+    updateCropFrame();
+  }
+
+  cropStage.addEventListener("keydown", (event) => {
+    const delta = event.shiftKey ? 10 : 1;
+    const moves = { ArrowLeft: [-delta, 0], ArrowRight: [delta, 0], ArrowUp: [0, -delta], ArrowDown: [0, delta] };
+    if (!cropState || !moves[event.key]) return;
+    event.preventDefault();
+    moveCrop(...moves[event.key]);
+  });
+
+  cropStage.addEventListener("pointerdown", (event) => {
+    if (!cropState || event.button !== 0) return;
+    const media = cropStage.querySelector("img, video");
+    const frame = cropFrame.getBoundingClientRect();
+    const naturalWidth = media.videoWidth || media.naturalWidth;
+    const naturalHeight = media.videoHeight || media.naturalHeight;
+    if (!naturalWidth || !naturalHeight) return;
+    event.preventDefault();
+    cropStage.setPointerCapture(event.pointerId);
+    let x = event.clientX;
+    let y = event.clientY;
+    const move = (next) => {
+      if (!cropState || next.pointerId !== event.pointerId) return;
+      moveCrop(next.clientX - x, next.clientY - y);
+      x = next.clientX;
+      y = next.clientY;
+    };
+    const stop = (next) => {
+      if (next.pointerId !== event.pointerId) return;
+      cropStage.removeEventListener("pointermove", move);
+      cropStage.removeEventListener("pointerup", stop);
+      cropStage.removeEventListener("pointercancel", stop);
+      cropStage.removeEventListener("lostpointercapture", stop);
+    };
+    cropStage.addEventListener("pointermove", move);
+    cropStage.addEventListener("pointerup", stop);
+    cropStage.addEventListener("pointercancel", stop);
+    cropStage.addEventListener("lostpointercapture", stop);
+  });
 
   function commitOrder() {
     const ids = [...grid.querySelectorAll(".card")].map((card) => card.dataset.id);
@@ -931,7 +1319,7 @@
     const next = ids.map((id) => byId.get(id)).filter(Boolean);
     if (next.length === state.sites.length) {
       state.sites = next;
-      saveSettings();
+      saveSettings(["sites"]);
     }
   }
 
@@ -983,19 +1371,27 @@
           } catch { /* 历史补录失败不影响最新一批 */ }
         }
       }
-      if (mergeBingHistory([...latest, ...older])) saveSettings();
+      if (mergeBingHistory([...latest, ...older])) saveSettings(["bingHistory"]);
       renderBing();
       pruneBingBlobs();
       if (state.wallpaper.type !== "bing") return;
       const pinned = state.bingHistory.find((image) => image.id === state.wallpaper.bingId);
       const current = state.wallpaper.auto ? state.bingHistory[0] : (pinned || state.bingHistory[0]);
       if (current && current.id !== state.wallpaper.bingId) await selectBing(current);
+      else if (current) {
+        const selection = selectionGen;
+        const shown = await showStored(`bing:${current.id}`);
+        if (shown === false && selection === selectionGen) {
+          const blob = await cacheBing(current.id);
+          if (selection === selectionGen && state.wallpaper.type === "bing" && state.wallpaper.bingId === current.id) showBlob(blob);
+        }
+      }
     } catch {
       renderBing();
       if (!state.bingHistory.length) $("bing-status").textContent = "暂时连不上必应，请稍后再试";
       if (state.wallpaper.type === "bing" && state.wallpaper.bingId) {
         const shown = await showStored(`bing:${state.wallpaper.bingId}`);
-        if (!shown) hideImage();
+        if (shown === false) hideImage();
       }
     }
   }
@@ -1028,6 +1424,28 @@
     button.dataset.timer = String(timer);
   }
 
+  let navigationCard = null;
+
+  function resetNavigationCard() {
+    if (!navigationCard) return;
+    navigationCard.classList.add("navigation-reset");
+    if (navigationCard.contains(document.activeElement)) document.activeElement.blur();
+  }
+
+  grid.addEventListener("pointermove", (event) => {
+    if (!navigationCard || (!event.movementX && !event.movementY)) return;
+    navigationCard.classList.remove("navigation-reset");
+    navigationCard = null;
+  });
+  grid.addEventListener("focusin", (event) => {
+    if (navigationCard && event.target.closest(".card") === navigationCard) {
+      navigationCard.classList.remove("navigation-reset");
+      navigationCard = null;
+    }
+  });
+  window.addEventListener("pageshow", (event) => { if (event.persisted) resetNavigationCard(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) resetNavigationCard(); });
+
   grid.addEventListener("click", (event) => {
     const action = event.target.closest("[data-act]");
     if (action) {
@@ -1048,7 +1466,7 @@
         }
         clearTimeout(Number(action.dataset.timer));
         state.sites = state.sites.filter((site) => site.id !== card.dataset.id);
-        saveSettings();
+        saveSettings(["sites"]);
         renderGrid();
       }
       return;
@@ -1056,6 +1474,14 @@
     if (suppressClick) {
       event.preventDefault();
       suppressClick = false;
+      return;
+    }
+    const card = event.target.closest(".card");
+    if (card && !event.defaultPrevented) {
+      if (navigationCard) navigationCard.classList.remove("navigation-reset");
+      navigationCard = card;
+      if (!panel.hidden) setPanel(false);
+      resetNavigationCard();
     }
   });
 
@@ -1148,7 +1574,7 @@
     if (!target) return;
     if (!isUrl) {
       pushHistory(query);
-      saveSettings();
+      saveSettings(["history"]);
     }
     const link = document.createElement("a");
     link.href = target;
@@ -1170,7 +1596,7 @@
     state.engine = button.dataset.engine;
     updateEngine();
     setMenu(false);
-    saveSettings();
+    saveSettings(["engine"]);
     $("q").focus();
     scheduleSug();
   });
@@ -1188,13 +1614,22 @@
   // 只在真正点击输入框时唤起历史：切换标签页回来的被动 focus 不应弹出来
   $("q").addEventListener("pointerdown", () => showHistory());
 
-  window.addEventListener("resize", () => hideSug());
+  window.addEventListener("resize", () => {
+    hideSug();
+    if (!cropBackdrop.hidden) updateCropFrame();
+  });
 
   $("q").addEventListener("compositionstart", () => hideSug());
 
   $("q").addEventListener("compositionend", () => scheduleSug());
 
-  $("q").addEventListener("blur", () => hideSug());
+  $("q").addEventListener("blur", (event) => {
+    if (!sugList.contains(event.relatedTarget)) hideSug();
+  });
+
+  sugList.addEventListener("focusout", (event) => {
+    if (event.relatedTarget !== $("q") && !sugList.contains(event.relatedTarget)) hideSug();
+  });
 
   $("q").addEventListener("keydown", (event) => {
     if (event.isComposing) return;
@@ -1221,13 +1656,43 @@
   });
 
   sugList.addEventListener("mousedown", (event) => {
+    if (event.target.closest("[data-remove-history]")) {
+      event.preventDefault();
+      return;
+    }
     const button = event.target.closest("[data-sug]");
     if (!button) return;
     event.preventDefault();
     applySug(button.dataset.sug);
   });
 
+  sugList.addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-remove-history]");
+    if (!remove) {
+      const button = event.target.closest("[data-sug]");
+      if (button && event.detail === 0) applySug(button.dataset.sug);
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    sugSeq += 1;
+    clearTimeout(sugTimer);
+    if (sugAbort) {
+      sugAbort.abort();
+      sugAbort = null;
+    }
+    const query = $("q").value.trim();
+    state.history = state.history.filter((text) => text !== remove.dataset.removeHistory);
+    saveSettings(["history"]);
+    $("q").focus();
+    renderSug(query ? historyMatches(query) : state.history.slice(0, HIST_VISIBLE), "history");
+  });
+
   $("edit-btn").addEventListener("click", () => setPanel(panel.hidden));
+  $("crop-current").addEventListener("click", openCrop);
+  $("crop-cancel").addEventListener("click", closeCrop);
+  $("crop-save").addEventListener("click", saveCrop);
+  cropBackdrop.addEventListener("click", (event) => { if (event.target === cropBackdrop) closeCrop(); });
   $("panel-close").addEventListener("click", () => setPanel(false));
 
   $("preset-list").addEventListener("click", (event) => {
@@ -1251,7 +1716,7 @@
 
   $("bing-auto").addEventListener("change", (event) => {
     state.wallpaper.auto = event.target.checked;
-    saveSettings();
+    saveSettings(["wallpaper"]);
     renderBing();
     if (state.wallpaper.auto && state.bingHistory[0]) selectBing(state.bingHistory[0]);
   });
@@ -1274,15 +1739,21 @@
       $("local-note").textContent = "";
       await addLocal(file);
     } catch (error) {
-      $("local-note").textContent = error && error.message ? error.message : "无法使用这张图片";
+      $("local-note").textContent = error && error.message ? error.message : "无法使用该壁纸";
     }
   });
+
+  $("file-limit").addEventListener("input", (event) => {
+    state.fileLimitMb = Number(event.target.value);
+    $("file-limit-value").textContent = `${state.fileLimitMb}MB`;
+  });
+  $("file-limit").addEventListener("change", () => saveSettings(["fileLimitMb"]));
 
   $("blur").addEventListener("input", (event) => {
     state.blur = Number(event.target.value);
     setBlur(state.blur);
   });
-  $("blur").addEventListener("change", () => saveSettings());
+  $("blur").addEventListener("change", () => saveSettings(["blur"]));
 
   $("reset").addEventListener("click", () => {
     const button = $("reset");
@@ -1295,13 +1766,21 @@
       }, 2000);
       return;
     }
+    resetGen += 1;
+    selectionGen += 1;
+    cropGen += 1;
+    if (!cropBackdrop.hidden) closeCrop();
+    hideImage();
     const localIds = state.localIds.slice();
     Object.assign(state, fresh(), { localIds, history: state.history });
+    applySkin();
+    $("file-limit").value = String(state.fileLimitMb);
+    $("file-limit-value").textContent = `${state.fileLimitMb}MB`;
     updateEngine();
     renderGrid();
     setBlur(state.blur);
     $("blur").value = String(state.blur);
-    saveSettings();
+    saveSettings(["engine", "sites", "wallpaper", "bingHistory", "blur", "dim", "fileLimitMb", "defaults"]);
     loadBing();
     button.classList.remove("is-armed");
     button.textContent = "恢复默认";
@@ -1333,39 +1812,115 @@
       }
       state.sites.push({ id: uid(), name, url });
     }
-    saveSettings();
+    saveSettings(["sites"]);
     renderGrid();
     closeDialog();
   });
 
   document.addEventListener("pointerdown", (event) => {
-    if (!backdrop.hidden) return;
+    if (!backdrop.hidden || !cropBackdrop.hidden) return;
     if (!engineMenu.hidden && !event.target.closest("#engine-menu") && !event.target.closest("#engine-btn")) setMenu(false);
     if (!panel.hidden && !event.target.closest("#panel") && !event.target.closest("#edit-btn")) setPanel(false);
   });
 
   document.addEventListener("keydown", (event) => {
+    if (!cropBackdrop.hidden && event.key === "Tab") {
+      const controls = [cropStage, $("crop-zoom"), $("crop-cancel"), $("crop-save")].filter((element) => !element.disabled);
+      const index = controls.indexOf(document.activeElement);
+      if (index < 0 || (event.shiftKey && index === 0) || (!event.shiftKey && index === controls.length - 1)) {
+        event.preventDefault();
+        controls[event.shiftKey ? controls.length - 1 : 0].focus();
+      }
+    }
     if (event.key === "Escape") {
-      if (!backdrop.hidden) closeDialog();
+      if (!cropBackdrop.hidden) closeCrop();
+      else if (!backdrop.hidden) closeDialog();
       else if (!engineMenu.hidden) setMenu(false);
       else if (!panel.hidden) setPanel(false);
       return;
     }
-    if (event.key === "/" && document.activeElement !== $("q") && backdrop.hidden) {
+    if (event.key === "/" && document.activeElement !== $("q") && backdrop.hidden && cropBackdrop.hidden) {
       event.preventDefault();
       $("q").focus();
     }
   });
 
+  let storageChangeGen = 0;
+  let startupStorageChanged = false;
+  const changedStorageFields = new Set();
+
+  if (globalThis.chrome && chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener(async (changes, area) => {
+      if (area !== "local" || !Object.keys(state).some((key) => Object.hasOwn(changes, `${STORE_KEY}:${key}`))) return;
+      if (!settingsReady) {
+        startupStorageChanged = true;
+        return;
+      }
+      Object.keys(state).forEach((key) => {
+        if (Object.hasOwn(changes, `${STORE_KEY}:${key}`)) changedStorageFields.add(key);
+      });
+      const gen = ++storageChangeGen;
+      try {
+        await saveQueue.catch(() => {});
+        const saved = await loadSettings();
+        if (gen !== storageChangeGen) return;
+        const updates = {};
+        changedStorageFields.forEach((key) => {
+          const value = saved && Object.hasOwn(saved, key) ? saved[key] : fresh()[key];
+          if (!writingFields.has(key) && JSON.stringify(value) !== JSON.stringify(state[key])) updates[key] = value;
+        });
+        changedStorageFields.clear();
+        if (!Object.keys(updates).length) return;
+        sanitize({ ...state, ...updates });
+        if (Object.hasOwn(updates, "engine")) updateEngine();
+        if (Object.hasOwn(updates, "sites")) renderGrid();
+        if (Object.hasOwn(updates, "blur") || Object.hasOwn(updates, "dim")) {
+          setBlur(state.blur);
+          $("blur").value = String(state.blur);
+        }
+        if (Object.hasOwn(updates, "fileLimitMb")) {
+          $("file-limit").value = String(state.fileLimitMb);
+          $("file-limit-value").textContent = `${state.fileLimitMb}MB`;
+        }
+        if (Object.hasOwn(updates, "localIds")) renderLocal();
+        if (Object.hasOwn(updates, "bingHistory")) renderBing();
+        if (Object.hasOwn(updates, "wallpaper")) {
+          selectionGen += 1;
+          cropGen += 1;
+          if (!cropBackdrop.hidden) closeCrop();
+          hideImage();
+          paintWallpaper();
+          renderBing();
+          syncActive();
+        }
+      } catch (error) {
+        reportStorageError(error);
+      }
+    });
+  }
+
   async function start() {
-    sanitize(await loadSettings());
+    document.documentElement.inert = true;
+    try {
+      let saved;
+      do {
+        startupStorageChanged = false;
+        saved = await loadSettings();
+      } while (startupStorageChanged);
+      sanitize(saved);
+    } catch (error) {
+      reportStorageError(error);
+      return;
+    }
+    settingsReady = true;
+    document.documentElement.inert = false;
     updateEngine();
     renderGrid();
     renderPresets();
     tick();
     setInterval(tick, 1000);
     setInterval(() => { if (!document.hidden) maybeRefreshBing(); }, BING_REFRESH_MS);
-    if (migrated) saveSettings();
+    if (migrated) saveSettings(["fileLimitMb"]);
     await paintWallpaper();
     loadBing();
   }

@@ -8,8 +8,9 @@
 </head>
 <body>
   <div class="bg" aria-hidden="true">
-    <div id="bg-preset" class="bg-preset skin-aurora"></div>
+    <div id="bg-preset" class="bg-preset"></div>
     <img id="bg-image" class="bg-image" alt="" draggable="false" />
+    <video id="bg-video" class="bg-video" autoplay muted loop playsinline></video>
   </div>
   <div class="dim" aria-hidden="true"></div>
   <div class="vignette" aria-hidden="true"></div>
@@ -66,8 +67,13 @@
     <div id="local-list" class="thumbs"></div>
     <p id="local-note" class="status"></p>
     <label class="upload">
-      选择本地图片
-      <input id="file" type="file" accept="image/*" hidden />
+      选择本地图片或视频
+      <input id="file" type="file" accept="image/*,video/*,.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm,.mov,.m4v,.ogv" hidden />
+    </label>
+    <button type="button" id="crop-current" class="text-btn crop-current">裁剪当前壁纸</button>
+    <label class="slider-row">
+      <span>文件上限 <output id="file-limit-value">50MB</output></span>
+      <input id="file-limit" type="range" min="20" max="300" step="10" value="50" aria-label="本地图片或视频文件大小上限，单位 MB" />
     </label>
 
     <label class="slider-row">
@@ -78,6 +84,17 @@
     <button type="button" id="reset" class="text-btn">恢复默认</button>
     <p class="kbd-hint">悬停导航卡片可编辑、删除，拖动可排序。按 / 聚焦搜索，Esc 关闭。</p>
   </aside>
+
+  <div id="crop-backdrop" class="backdrop crop-backdrop" hidden>
+    <section class="dialog crop-dialog" role="dialog" aria-modal="true" aria-labelledby="crop-title">
+      <h2 id="crop-title">裁剪当前壁纸</h2>
+      <p id="crop-help" class="hint">拖动图片或视频调整位置，也可聚焦预览后按方向键移动（按住 Shift 加速）；使用滑块或滚轮缩放。虚线框内为当前窗口的显示范围，窗口比例改变时显示范围会相应调整。</p>
+      <div id="crop-stage" class="crop-stage" tabindex="0" role="group" aria-label="壁纸裁剪预览" aria-describedby="crop-help"><div id="crop-frame" class="crop-frame"></div></div>
+      <p id="crop-error" class="form-error" role="status"></p>
+      <label>缩放 <output id="crop-zoom-value">100%</output><input id="crop-zoom" type="range" min="1" max="10" step="0.01" value="1" aria-label="壁纸缩放" /></label>
+      <div class="dialog-actions"><button type="button" id="crop-cancel" class="btn">取消</button><button type="button" id="crop-save" class="btn primary">确认裁剪</button></div>
+    </section>
+  </div>
 
   <div id="backdrop" class="backdrop" hidden>
     <form id="site-form" class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title" novalidate>
